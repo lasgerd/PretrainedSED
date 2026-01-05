@@ -59,6 +59,8 @@ class PatchEmbed_v2(nn.Module):
         super().__init__()
         self.patch_height = patch_height
         self.patch_width = patch_width
+
+        # b: batch, c: channel, h: height方向图片个数, w: width方向图片个数， p1: 每个patch的高度，p2：每个patch的宽度
         self.patch_maker = Rearrange('b c (h p1) (w p2) -> b (w h) (p1 p2 c)', p1=patch_height, p2=patch_width)
         self.patch_embed = nn.Linear(patch_height * patch_width * input_dim, embed_dim)
 
@@ -66,7 +68,7 @@ class PatchEmbed_v2(nn.Module):
         height = melspec.shape[2] - melspec.shape[2] % self.patch_height
         width = melspec.shape[3] - melspec.shape[3] % self.patch_width
         patch = self.patch_maker(melspec[:, :, :height, :width])
-        patch_embed = self.patch_embed(patch)
+        patch_embed = self.patch_embed(patch) # 把patch展开后继续投影
 
         if length is not None:
             patch_length = (torch.div(height, self.patch_height, rounding_mode='trunc')) * torch.div(
@@ -74,6 +76,9 @@ class PatchEmbed_v2(nn.Module):
         else:
             patch_length = None
 
+        # patch：投影前的数据，纯粹按照patch展开
+        # patch_embed：把patch经过线性投影后的数据，真正后续要使用的数据
+        # patch_length：patch的个数
         return patch, patch_embed, patch_length
 
 
@@ -130,6 +135,7 @@ class FrameAST(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    # 将spec分割为多个patch，再展开为一列，形成类似于“词组”的东西
     def prepare_tokens(self, x, mask_index, length, mask=True):
         B, nc, h, w = x.shape
         mel_patches, x, patch_length = self.patch_embed(x, length)  # patch linear embedding

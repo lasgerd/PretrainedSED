@@ -171,7 +171,7 @@ class PredictionsWrapper(nn.Module):
     def forward(self, x):
         # base model is expected to output a sequence (see Eq. (1) in paper)
         # (batch size x sequence length x embedding dimension)
-        x = self.model(x)
+        x = self.model(x) # 实际上的获取对应模型最后N层的输出
 
         # ATST: x.shape: batch size x 250 x 768
         # PaSST: x.shape: batch size x 250 x 768

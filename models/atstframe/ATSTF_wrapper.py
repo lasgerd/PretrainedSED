@@ -57,7 +57,7 @@ class ATSTWrapper(BaseModelWrapper):
                 raise ValueError(f"Check separate params for ATST! Unknown key: {k}")
         return list(reversed(pt_params))
 
-
+# dB尺度的mel-stft
 class ATSTMel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -71,14 +71,14 @@ class ATSTMel(torch.nn.Module):
             n_mels=64
         )
         self.amp_to_db = AmplitudeToDB(stype="power", top_db=80)
-        self.scaler = MinMax(min=-79.6482, max=50.6842)
+        self.scaler = MinMax(min=-79.6482, max=50.6842) # 投射到0~1
 
     def amp2db(self, spec):
         return self.amp_to_db(spec).clamp(min=-50, max=80)
 
     def forward(self, audio):
         with torch.autocast(device_type="cuda", enabled=False):
-            spec = self.mel_transform(audio)
+            spec = self.mel_transform(audio) # 默认是功率谱
         spec = self.scaler(self.amp2db(spec))
         spec = spec.unsqueeze(1)
         return spec
