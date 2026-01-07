@@ -4,8 +4,10 @@ from functools import partial
 import torch
 from torch import nn
 from .audio_transformer import *
+from torchvision.models.resnet import BasicBlock
+from ..conformer.encoder import ConformerBlock
 
-class StudentATST(nn.Module):
+class StudentSED(nn.Module):
     def __init__(self, nprompt=0, spec_h=64, spec_w=1001, patch_w=16, patch_h=16, pos_type="cut", in_chans=1,
                  num_classes=0, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0.0, attn_drop_rate=0.,
@@ -36,11 +38,18 @@ class StudentATST(nn.Module):
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(depth)])
+
+        self.conformer_blocks = nn.Sequential(*[
+            ConformerBlock(encoder_dim = embed_dim,num_attention_heads = num_heads,feed_forward_expansion_factor=int(mlp_ratio),
+                           feed_forward_dropout_p=drop_rate,attention_dropout_p=attn_drop_rate) for _ in range(depth)
+        ])
+
         self.norm_frame = norm_layer(embed_dim)
 
         trunc_normal_(self.pos_embed, std=.02)
@@ -139,20 +148,10 @@ class StudentATST(nn.Module):
         output = []
         if self.nprompt > 0:
             x = torch.cat([self.prompt_embed.expand(x.shape[0], -1, -1), x], dim=1)
-        for i, blk in enumerate(self.blocks):
-            x = blk(x, patch_length + self.nprompt)
-            if len(self.blocks) - i <= n:
+        for i, blk in enumerate(self.conformer_blocks):
+            x = blk(x)
+            if len(self.conformer_blocks) - i <= n:
                 norm_x = self.norm_frame(x)
-                if scene:
-                    length_mask = torch.arange(x.shape[1] - self.nprompt).to(x.device) < patch_length.unsqueeze(1)
-                    avg = torch.sum(norm_x[:, self.nprompt:] * length_mask.unsqueeze(-1), dim=1) / (
-                            patch_length.unsqueeze(-1) + 1e-6)
-                    negative = (~length_mask) * -1e10
-                    # max = torch.max(norm_x[:,self.nprompt:]+negative.unsqueeze(-1),1).values
-                    output.append(avg)
-                    if self.nprompt > 0:
-                        output.append(torch.mean(norm_x[:, :self.nprompt], dim=1))
-                else:
-                    output.append(norm_x[:, self.nprompt:])
+                output.append(norm_x[:, self.nprompt:])
 
         return torch.cat(output, dim=-1)

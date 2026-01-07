@@ -13,12 +13,11 @@ from models.asit.ASIT_wrapper import ASiTWrapper
 from models.frame_mn.Frame_MN_wrapper import FrameMNWrapper
 from models.prediction_wrapper import PredictionsWrapper
 from models.frame_mn.utils import NAME_TO_WIDTH
+
 def count_parameters(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
-
-
 
 def sound_event_detection(args):
     """
