@@ -11,76 +11,35 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 import sed_scores_eval
 
-from helpers.decode import batched_decode_preds
-from helpers.encode import ManyHotEncoder
-from models.atstframe.ATSTF_wrapper import ATSTWrapper
-from models.beats.BEATs_wrapper import BEATsWrapper
-from models.frame_passt.fpasst_wrapper import FPaSSTWrapper
-from models.m2d.M2D_wrapper import M2DWrapper
-from models.asit.ASIT_wrapper import ASiTWrapper
-from models.prediction_wrapper import PredictionsWrapper
+from models.atstframe.atst_student import StudentSED
 from helpers.augment import frame_shift, time_mask, mixup, filter_augmentation, mixstyle, RandomResizeCrop
-from helpers.utils import worker_init_fn
+from data_util.audioset_classes import as_strong_train_classes, as_strong_eval_classes
+from helpers.encode import ManyHotEncoder
 from data_util.audioset_strong import get_training_dataset, get_eval_dataset
 from data_util.audioset_strong import get_temporal_count_balanced_sample_weights, get_uniform_sample_weights, \
     get_weighted_sampler
-from data_util.audioset_classes import as_strong_train_classes, as_strong_eval_classes
-from models.frame_mn.Frame_MN_wrapper import FrameMNWrapper
-from models.frame_mn.utils import NAME_TO_WIDTH
+from helpers.utils import worker_init_fn
+from models.atstframe.ATSTF_wrapper import ATSTWrapper
+from models.prediction_wrapper import PredictionsWrapper
 
+# v0.1
 
 class PLModule(pl.LightningModule):
-    def __init__(self, config, encoder):
+    def __init__(self, config, encoder,teacher_model,student_model):
         super().__init__()
         self.config = config
         self.encoder = encoder
+        self.teacher = teacher_model
+        self.student = student_model
 
-        if config.pretrained == "scratch":
-            checkpoint = None
-        elif config.pretrained == "ssl":
-            checkpoint = "ssl"
-        elif config.pretrained == "weak":
-            checkpoint = "weak"
-        elif config.pretrained == "strong":
-            checkpoint = "strong_1"
-        else:
-            raise ValueError(f"Unknown pretrained checkpoint: {config.pretrained}")
-
-        # load transformer model
-        if config.model_name == "BEATs":
-            beats = BEATsWrapper()
-            model = PredictionsWrapper(beats, checkpoint=f"BEATs_{checkpoint}" if checkpoint else None,
-                                       seq_model_type=config.seq_model_type)
-        elif config.model_name == "ATST-F":
-            atst = ATSTWrapper()
-            model = PredictionsWrapper(atst, checkpoint=f"ATST-F_{checkpoint}" if checkpoint else None,
-                                       seq_model_type=config.seq_model_type)
-        elif config.model_name == "fpasst":
-            fpasst = FPaSSTWrapper()
-            model = PredictionsWrapper(fpasst, checkpoint=f"fpasst_{checkpoint}" if checkpoint else None,
-                                       seq_model_type=config.seq_model_type)
-        elif config.model_name == "M2D":
-            m2d = M2DWrapper()
-            model = PredictionsWrapper(m2d, checkpoint=f"M2D_{checkpoint}" if checkpoint else None,
-                                       seq_model_type=config.seq_model_type,
-                                       embed_dim=m2d.m2d.cfg.feature_d)
-        elif config.model_name == "ASIT":
-            asit = ASiTWrapper()
-            model = PredictionsWrapper(asit, checkpoint=f"ASIT_{checkpoint}" if checkpoint else None,
-                                       seq_model_type=config.seq_model_type)
-        elif config.model_name.startswith("frame_mn"):
-            width = NAME_TO_WIDTH(config.model_name)
-            frame_mn = FrameMNWrapper(width)
-            embed_dim = frame_mn.state_dict()['frame_mn.features.16.1.bias'].shape[0]
-            model = PredictionsWrapper(frame_mn, checkpoint=f"{config.model_name}_strong_1", embed_dim=embed_dim)
-        else:
-            raise NotImplementedError(f"Model {config.model_name} not (yet) implemented")
-
-        self.model = model
+        self.teacher.eval()
+        for param in self.teacher.parameters():
+            param.requires_grad = False
 
         # prepare ingredients for knowledge distillation
         assert 0 <= config.distillation_loss_weight <= 1, "Lambda for Knowledge Distillation must be between 0 and 1."
         self.strong_loss = nn.BCEWithLogitsLoss()
+        self.distill_loss = nn.KLDivLoss(reduction='batchmean')
 
         self.freq_warp = RandomResizeCrop((1, 1.0), time_scale=(1.0, 1.0))
 
@@ -93,7 +52,7 @@ class PLModule(pl.LightningModule):
 
     def forward(self, batch):
         x = batch["audio"]
-        mel = self.model.mel_forward(x)
+        mel = self.student_model.mel_forward(x)
         y_strong, _ = self.model(mel)
         return y_strong
 
@@ -106,7 +65,7 @@ class PLModule(pl.LightningModule):
         params_leq1D = []
         params_geq2D = []
 
-        for name, param in self.model.named_parameters():
+        for name, param in self.student.named_parameters():
             if param.requires_grad:
                 if param.ndimension() >= 2:
                     params_geq2D.append(param)
@@ -192,7 +151,7 @@ class PLModule(pl.LightningModule):
             pseudo_labels = torch.zeros_like(labels)
             assert self.config.distillation_loss_weight == 0
 
-        mel = self.model.mel_forward(x)
+        mel = self.student.mel_forward(x)
 
         # time rolling
         if self.config.frame_shift_range > 0:
@@ -204,7 +163,7 @@ class PLModule(pl.LightningModule):
                 shift_range=self.config.frame_shift_range
             )
 
-        # mixup
+        # mix up
         if self.config.mixup_p > random.random():
             mel, labels, pseudo_labels = mixup(
                 mel,
@@ -212,7 +171,7 @@ class PLModule(pl.LightningModule):
                 pseudo_strong=pseudo_labels
             )
 
-        # mixstyle
+        # mix style
         if self.config.mixstyle_p > random.random():
             mel = mixstyle(
                 mel
@@ -241,14 +200,30 @@ class PLModule(pl.LightningModule):
             mel = mel.unsqueeze(1)
 
         # forward through network; use strong head
-        y_hat_strong, _ = self.model(mel)
+        y_hat_strong_teacher, _ = self.teacher(mel)
+        y_hat_strong_student, _ = self.student(mel)
 
-        strong_supervised_loss = self.strong_loss(y_hat_strong, labels)
+        last_n_layers_teacher = self.teacher.get_intermediate_layers(
+            mel,
+            self.teacher.fake_length.to(mel).repeat(len(mel)),
+            1,
+            scene=False
+        )
+        last_n_layers_student = self.student.get_intermediate_layers(
+            mel,
+            self.teacher.fake_length.to(mel).repeat(len(mel)),
+            1,
+            scene=False
+        )
+
+
+
+        strong_supervised_loss = self.strong_loss(y_hat_strong_student, labels)
 
         if self.config.distillation_loss_weight > 0:
-            strong_distillation_loss = self.strong_loss(y_hat_strong, pseudo_labels)
+            strong_distillation_loss = self.strong_loss(last_n_layers_student, last_n_layers_teacher)
         else:
-            strong_distillation_loss = torch.tensor(0., device=y_hat_strong.device, dtype=y_hat_strong.dtype)
+            raise ValueError(f"distillation_loss_weight must be larger than 0, got {self.config.distillation_loss_weight}")
 
         loss = self.config.distillation_loss_weight * strong_distillation_loss \
                + (1 - self.config.distillation_loss_weight) * strong_supervised_loss
@@ -263,104 +238,17 @@ class PLModule(pl.LightningModule):
 
         return loss
 
-    def validation_step(self, val_batch, batch_idx):
-        # bring ground truth into shape needed for evaluation
-        for f, gt_string in zip(val_batch["filename"], val_batch["gt_string"]):
-            f = f[:-len(".mp3")]
-            events = [e.split(";;") for e in gt_string.split("++")]
-            self.val_ground_truth[f] = [(float(e[0]), float(e[1]), e[2]) for e in events]
-            self.val_duration[f] = self.val_durations_df[self.val_durations_df["filename"] == f]["duration"].values[0]
-
-        y_hat_strong = self(val_batch)
-        y_strong = val_batch["strong"]
-
-        loss = self.strong_loss(y_hat_strong, y_strong)
-        self.val_loss.append(loss.cpu())
-
-        scores_raw, scores_postprocessed, prediction_dfs = batched_decode_preds(
-            y_hat_strong.float(),
-            val_batch['filename'],
-            self.encoder,
-            median_filter=self.config.median_window
-        )
-
-        self.val_predictions_strong.update(
-            scores_postprocessed
-        )
-
-    def on_validation_epoch_end(self):
-        gt_unique_events = set([e[2] for f, events in self.val_ground_truth.items() for e in events])
-        train_unique_events = set(self.encoder.labels)
-        # evaluate on all classes that are in both train and test sets (407 classes)
-        class_intersection = gt_unique_events.intersection(train_unique_events)
-
-        assert len(class_intersection) == len(set(as_strong_train_classes).intersection(as_strong_eval_classes)) == 407, \
-            f"Intersection unique events. Expected: {len(set(as_strong_train_classes).intersection(as_strong_eval_classes))}," \
-            f" Actual: {len(class_intersection)}"
-
-        # filter ground truth according to class_intersection
-        val_ground_truth = {fid: [event for event in self.val_ground_truth[fid] if event[2] in class_intersection]
-                            for fid in self.val_ground_truth}
-        # drop audios without events - aligned with DESED evaluation procedure
-        val_ground_truth = {fid: events for fid, events in val_ground_truth.items() if len(events) > 0}
-        # keep only corresponding audio durations
-        audio_durations = {
-            fid: self.val_duration[fid] for fid in val_ground_truth.keys()
-        }
-
-        # filter files in predictions
-        as_strong_preds = {
-            fid: self.val_predictions_strong[fid] for fid in val_ground_truth.keys()
-        }
-        # filter classes in predictions
-        unused_classes = list(set(self.encoder.labels).difference(class_intersection))
-        for f, df in as_strong_preds.items():
-            df.drop(columns=list(unused_classes), axis=1, inplace=True)
-
-        segment_based_pauroc = sed_scores_eval.segment_based.auroc(
-            as_strong_preds,
-            val_ground_truth,
-            audio_durations,
-            max_fpr=0.1,
-            segment_length=1.0,
-            num_jobs=1
-        )
-
-        psds1 = sed_scores_eval.intersection_based.psds(
-            as_strong_preds,
-            val_ground_truth,
-            audio_durations,
-            dtc_threshold=0.7,
-            gtc_threshold=0.7,
-            cttc_threshold=None,
-            alpha_ct=0,
-            alpha_st=1,
-            num_jobs=1
-        )
-
-        # "val/psds1_macro_averaged" is psds1 without penalization for performance
-        #  variations across classes
-        logs = {"val/loss": torch.as_tensor(self.val_loss).mean().cuda(),
-                "val/psds1": psds1[0],
-                "val/psds1_macro_averaged": np.array([v for k, v in psds1[1].items()]).mean(),
-                "val/pauroc": segment_based_pauroc[0]['mean'],
-                }
-
-        self.log_dict(logs, sync_dist=False)
-        self.val_predictions_strong = {}
-        self.val_ground_truth = {}
-        self.val_duration = {}
-        self.val_loss = []
-
-
 def train(config):
     # Train Models on temporally-strong portion of AudioSet.
+    atst = ATSTWrapper()
+    teacher_model = PredictionsWrapper(atst, checkpoint="ATST-F_strong_1")
+    student_model = StudentSED(num_classes=15)
 
     # logging is done using wandb
     wandb_logger = WandbLogger(
-        project="PTSED",
-        notes="Pre-Training Transformers for Sound Event Detection on AudioSet Strong.",
-        tags=["AudioSet Strong", "Sound Event Detection", "Pseudo Labels", "Knowledge Disitillation"],
+        project="kd_from_ptsed",
+        notes="Using conformer to do knowledge distillation from atst-model in ptsed",
+        tags=["AudioSet Strong", "Sound Event Detection", "Knowledge Disitillation"],
         config=config,
         name=config.experiment_name
     )
@@ -394,7 +282,7 @@ def train(config):
                          batch_size=config.batch_size)
 
     # create pytorch lightening module
-    pl_module = PLModule(config, encoder)
+    pl_module = PLModule(config, encoder,teacher_model,student_model)
 
     # create the pytorch lightening trainer by specifying the number of epochs to train, the logger,
     # on which kind of device(s) to train and possible callbacks
@@ -411,35 +299,6 @@ def train(config):
     trainer.fit(pl_module, train_dl, eval_dl)
 
     wandb.finish()
-
-
-def evaluate(config):
-    # only evaluation of pre-trained models
-    # encoder manages encoding and decoding of model predictions
-    encoder = ManyHotEncoder(as_strong_train_classes)
-    eval_set = get_eval_dataset(encoder)
-
-    # eval dataloader
-    eval_dl = DataLoader(dataset=eval_set,
-                         worker_init_fn=worker_init_fn,
-                         num_workers=config.num_workers,
-                         batch_size=config.batch_size)
-
-    # create pytorch lightening module
-    pl_module = PLModule(config, encoder)
-
-    # create the pytorch lightening trainer by specifying the number of epochs to train, the logger,
-    # on which kind of device(s) to train and possible callbacks
-    trainer = pl.Trainer(max_epochs=config.n_epochs,
-                         accelerator='auto',
-                         devices=config.num_devices,
-                         precision=config.precision,
-                         num_sanity_val_steps=0,
-                         check_val_every_n_epoch=config.check_val_every_n_epoch)
-
-    # start evaluation
-    trainer.validate(pl_module, eval_dl)
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Configuration Parser. ')
@@ -499,7 +358,4 @@ if __name__ == '__main__':
                         default=None)
 
     args = parser.parse_args()
-    if args.evaluate:
-        evaluate(args)
-    else:
-        train(args)
+    train(args)

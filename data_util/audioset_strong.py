@@ -1,9 +1,11 @@
 import os
+import glob
 from time import perf_counter
 import datasets
 import numpy as np
 import pandas as pd
 import torch
+from pathlib import Path
 from torch.utils.data import (
     Dataset as TorchDataset,
     DistributedSampler,
@@ -124,7 +126,6 @@ def get_training_dataset(
         print("Using Wavmix!")
         dataset = MixupDataset(dataset, rate=wavmix_p)
     return dataset
-
 
 def get_eval_dataset(
         label_encoder,
@@ -310,6 +311,34 @@ def get_weighted_sampler(
         num_replicas=num_nodes,
         rank=rank,
     )
+
+
+
+class ASDataset(TorchDataset):
+    def __init__(self, parquet_dir, arrow_full_path, hop_size_ms = 100,sample_rate=16000, transform=None):
+        self.parquet_dir = parquet_dir
+        self.arrow_full_path = arrow_full_path
+        self.sample_rate = sample_rate
+        self.transform = transform
+        self.hop_size_ms = hop_size_ms
+        self.dataset_local = None
+        self.transform = transform
+
+    def __len__(self):
+        return len(glob.glob(os.path.join(self.parquet_dir, "*.parquet")))
+
+    def __getitem__(self, idx):
+        sample = self.dataset_local[idx]
+        return self.transform(sample)
+
+    def convert_parquet_to_arrow(self):
+        file_path = Path(self.arrow_full_path)
+        if not file_path.exists():
+            dataset_local = datasets.load_dataset("parquet", data_files={"train": self.parquet_dir + "/*.parquet"})
+            dataset_local.save_to_disk(self.arrow_full_path)
+        self.dataset_local = datasets.load_from_disk(self.arrow_full_path)
+
+
 
 
 if __name__ == "__main__":

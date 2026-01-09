@@ -1,0 +1,21 @@
+function parseParquetText(parquet_info)
+%PARSEPARQUETTEXT parse the raw text in the parquet to get useful info.
+%   此处显示详细说明
+%%
+str_num = 5;
+sub_str_list = [];
+
+% 我只关心strong events
+for i = 2
+    sub_str = parquet_info(i);
+    [startIndex,endIndex] = regexpi(sub_str,':');
+    sub_str_list = [sub_str_list string(sub_str{1}(endIndex+1:end))];
+
+    [startIndex,endIndex] = regexpi(sub_str{1},'|');
+
+    keyboard
+end
+
+
+end
+

@@ -6,6 +6,7 @@ from torch import nn
 from .audio_transformer import *
 from torchvision.models.resnet import BasicBlock
 from ..conformer.encoder import ConformerBlock
+from ..atstframe.ATSTF_wrapper import *
 
 class StudentSED(nn.Module):
     def __init__(self, nprompt=0, spec_h=64, spec_w=1001, patch_w=16, patch_h=16, pos_type="cut", in_chans=1,
@@ -24,6 +25,8 @@ class StudentSED(nn.Module):
 
         self.patch_embed = PatchEmbed_v2(patch_h, patch_w, embed_dim)
         self.mask_embed = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+
+        self.atst_mel = ATSTMel()
 
         # hack
         self.nprompt = nprompt
@@ -51,6 +54,8 @@ class StudentSED(nn.Module):
         ])
 
         self.norm_frame = norm_layer(embed_dim)
+        self.linear = nn.Linear(768,num_classes)
+        self.out_layer = nn.Sigmoid()
 
         trunc_normal_(self.pos_embed, std=.02)
         trunc_normal_(self.mask_embed, std=.02)
@@ -100,7 +105,9 @@ class StudentSED(nn.Module):
         for i, blk in enumerate(self.blocks):
             x = blk(x, patch_length + self.nprompt)
 
-        frame_repr = self.norm_frame(x)
+        x = self.norm_frame(x)
+        x = self.linear(x)
+        frame_repr = self.out_layer(x)
 
         return frame_repr[:, self.nprompt:][mask_index]
 
@@ -155,3 +162,6 @@ class StudentSED(nn.Module):
                 output.append(norm_x[:, self.nprompt:])
 
         return torch.cat(output, dim=-1)
+
+    def mel_forward(self, x):
+        return self.atst_mel(x)
